@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>隨身翻譯</title>
+  <meta name="description" content="語音翻譯、拍照翻譯，繁體中文與英日韓越泰印尼文互譯">
+  <meta name="theme-color" content="#14532d">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="隨身翻譯">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <h1>隨身翻譯</h1>
+    <button id="settingsBtn" class="icon-btn" aria-label="設定">⚙️ 設定</button>
+  </header>
+
+  <div id="offline" class="banner" hidden>⚠️ 目前沒有網路，翻譯需要網路</div>
+  <div id="noSpeech" class="banner" hidden>⚠️ 這個瀏覽器不能用語音，請改用 Chrome 或 Safari，或按「⌨️ 打字」</div>
+
+  <section class="lang-bar">
+    <div class="label">對方說的語言：</div>
+    <div id="langGrid" class="lang-grid"></div>
+  </section>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="talk">🗣️ 說話翻譯</button>
+    <button class="tab" data-tab="photo">📷 拍照翻譯</button>
+  </nav>
+
+  <main>
+    <section id="talk" class="panel">
+      <div id="chat" class="chat"></div>
+      <div id="live" class="live" hidden></div>
+    </section>
+
+    <section id="photo" class="panel" hidden>
+      <label class="photo-btn">
+        📷 拍照或選照片
+        <input id="photoInput" type="file" accept="image/*" hidden>
+      </label>
+      <p class="hint">拍菜單、路標、說明書，會翻成中文<br>照片上的文字：<b id="photoLang">英文</b>（在上面切換）</p>
+      <img id="photoPreview" class="photo-preview" alt="剛拍的照片" hidden>
+      <div id="photoStatus" class="status" hidden></div>
+      <div id="photoResult" class="photo-result"></div>
+    </section>
+  </main>
+
+  <footer id="talkBar" class="talk-bar">
+    <div id="typeRow" class="type-row" hidden>
+      <textarea id="typeInput" rows="2" placeholder="在這裡打字…"></textarea>
+      <div class="type-actions">
+        <button id="typeMe" class="small-btn me">我說的（中文）</button>
+        <button id="typeThem" class="small-btn them">對方說的</button>
+      </div>
+    </div>
+    <div class="mic-row">
+      <button id="micMe" class="mic me">
+        <span class="mic-icon">🎤</span>
+        <span class="mic-main">我說中文</span>
+        <span class="mic-sub">按一下開始說</span>
+      </button>
+      <button id="micThem" class="mic them">
+        <span class="mic-icon">🎤</span>
+        <span class="mic-main" id="themMain">對方說英文</span>
+        <span class="mic-sub" id="themSub">Tap to speak</span>
+      </button>
+    </div>
+    <div class="tool-row">
+      <button id="typeBtn" class="small-btn">⌨️ 打字</button>
+      <button id="clearBtn" class="small-btn">🗑️ 清除對話</button>
+    </div>
+  </footer>
+
+  <div id="show" class="show" hidden>
+    <div id="showInner" class="show-inner">
+      <div id="showText" class="show-text"></div>
+    </div>
+    <div class="show-actions">
+      <button id="flipBtn">🔄 翻轉</button>
+      <button id="showSpeakBtn">🔊 唸出來</button>
+      <button id="showClose">✕ 關閉</button>
+    </div>
+  </div>
+
+  <dialog id="settings">
+    <h2>設定</h2>
+    <label class="check"><input type="checkbox" id="optAutoSpeak"> 翻譯完自動唸出來</label>
+    <label class="check"><input type="checkbox" id="optSlow"> 唸慢一點</label>
+    <label class="check"><input type="checkbox" id="optBig"> 字再大一點</label>
+    <p class="about">免費使用：語音辨識與朗讀用手機內建功能，翻譯用免費的網路翻譯服務，拍照文字辨識在手機上完成。</p>
+    <button id="settingsClose" class="small-btn">完成</button>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
