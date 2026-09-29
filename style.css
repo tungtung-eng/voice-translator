@@ -93,6 +93,12 @@ main { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
 .mic-sub { font-size: .65em; opacity: .9; }
 .mic.listening { animation: pulse 1s infinite; box-shadow: 0 0 0 6px #facc15; }
 .mic:disabled { opacity: .45; }
+.mic.dim { opacity: .55; }
+.auto-btn {
+  display: block; width: 100%; margin-bottom: 10px; border: 3px solid #ca8a04; background: #fef9c3;
+  color: #713f12; border-radius: 16px; padding: 10px; font-size: .9em; font-weight: 800;
+}
+.auto-btn.on { background: #dc2626; border-color: #dc2626; color: #fff; }
 @keyframes pulse { 50% { transform: scale(.97); } }
 
 .tool-row { display: flex; gap: 10px; margin-top: 10px; }

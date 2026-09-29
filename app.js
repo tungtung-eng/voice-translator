@@ -91,15 +91,21 @@ function pickVoice(lang) {
   return v || voices.find((x) => norm(x.lang).startsWith(prefix)) || null;
 }
 
+// Resolves when speaking finishes, so auto mode doesn't listen to its own voice.
 function speak(text, lang) {
-  if (!window.speechSynthesis || !text) return;
+  if (!window.speechSynthesis || !text) return Promise.resolve();
   speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(text);
   u.lang = lang;
   const v = pickVoice(lang);
   if (v) u.voice = v;
   u.rate = settings.slow ? 0.75 : 0.95;
-  speechSynthesis.speak(u);
+  return new Promise((resolve) => {
+    // Some browsers never fire onend; don't wait forever.
+    const safety = setTimeout(resolve, 3000 + text.length * 250);
+    u.onend = u.onerror = () => { clearTimeout(safety); resolve(); };
+    speechSynthesis.speak(u);
+  });
 }
 
 // iOS only allows speech that started from a tap; speaking once inside a tap unlocks it.
@@ -121,7 +127,12 @@ function renderLangs() {
     b.className = 'lang-btn' + (code === settings.lang ? ' active' : '');
     b.innerHTML = '<span class="flag">' + l.flag + '</span>' + l.name;
     b.setAttribute('aria-pressed', code === settings.lang);
-    b.onclick = () => { settings.lang = code; save('settings', settings); renderLangs(); };
+    b.onclick = () => {
+      settings.lang = code;
+      save('settings', settings);
+      renderLangs();
+      if (autoMode && rec) { recAborted = true; rec.abort(); } // restarts in the new language
+    };
     grid.appendChild(b);
   }
   const l = LANGS[settings.lang];
@@ -201,7 +212,7 @@ async function doTranslate(el, item) {
     save('history', history);
     updateBubble(el, item);
     el.scrollIntoView({ behavior: 'smooth', block: 'end' });
-    if (settings.autoSpeak) speak(item.translated, targetLang(item));
+    if (settings.autoSpeak) await speak(item.translated, targetLang(item));
   } catch (e) {
     console.error(e);
     item.error = true;
@@ -214,23 +225,41 @@ function handleText(who, text) {
   if (!text) return;
   const item = { who, lang: settings.lang, text, translated: null, time: Date.now() };
   const el = addBubble(item);
-  doTranslate(el, item);
+  return doTranslate(el, item);
 }
 
 // ---------- Speech recognition ----------
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let rec = null;
-let recWho = null;
+let recAborted = false;
+
+// Auto conversation: listen to each side in turn; a pause ends a turn,
+// then the translation is spoken and it's the other side's turn.
+let autoMode = false;
+let autoTurn = 'me';
+let autoBusy = false; // translating / speaking, not listening
+let autoRestartTimer = null;
+const other = (who) => (who === 'me' ? 'them' : 'me');
 
 function setListening(who) {
   for (const [id, w] of [['micMe', 'me'], ['micThem', 'them']]) {
     const b = $(id);
-    b.classList.toggle('listening', who === w);
-    b.disabled = who != null && who !== w;
-    b.querySelector('.mic-sub').textContent = who === w
-      ? (w === 'me' ? '正在聽…說完再按一下' : 'Listening…')
-      : (w === 'me' ? '按一下開始說' : LANGS[settings.lang].tap);
+    const active = who === w;
+    b.classList.toggle('listening', active);
+    b.disabled = !autoMode && who != null && !active;
+    b.classList.toggle('dim', autoMode && !active);
+    let sub;
+    if (active) sub = w === 'me' ? (autoMode ? '正在聽…停頓就翻譯' : '正在聽…說完再按一下') : 'Listening…';
+    else if (autoMode) sub = w === 'me' ? '按這裡換我說' : LANGS[settings.lang].tap;
+    else sub = w === 'me' ? '按一下開始說' : LANGS[settings.lang].tap;
+    b.querySelector('.mic-sub').textContent = sub;
   }
+}
+
+function turnPrompt(who) {
+  if (who === 'me') return autoMode ? '🎤 輪到你說中文（說完停一下就會翻譯）' : '🎤 請說中文…';
+  const l = LANGS[settings.lang];
+  return autoMode ? '🎤 輪到對方說' + l.name + '：' + l.tap : '🎤 ' + l.tap + '…';
 }
 
 function showLive(text) {
@@ -243,22 +272,39 @@ function showLive(text) {
 function listen(who) {
   unlockTts();
   if (window.speechSynthesis) speechSynthesis.cancel();
-  if (rec) { rec.stop(); return; }
   if (!SR) {
     $('noSpeech').hidden = false;
     $('typeRow').hidden = false;
     return;
   }
-  recWho = who;
-  rec = new SR();
-  rec.lang = who === 'me' ? ZH : LANGS[settings.lang].speech;
-  rec.interimResults = true;
-  rec.continuous = false;
-  rec.maxAlternatives = 1;
+  if (autoMode) {
+    // In auto mode the buttons just hand the turn to that side.
+    autoTurn = who;
+    if (rec) { recAborted = true; rec.abort(); } else if (!autoBusy) startRec(who);
+    return;
+  }
+  if (rec) { rec.stop(); return; }
+  startRec(who);
+}
+
+function scheduleAutoListen(delay) {
+  clearTimeout(autoRestartTimer);
+  autoRestartTimer = setTimeout(() => { if (autoMode && !rec && !autoBusy) startRec(autoTurn); }, delay);
+}
+
+function startRec(who) {
+  recAborted = false;
+  const r = new SR();
+  rec = r;
+  r.lang = who === 'me' ? ZH : LANGS[settings.lang].speech;
+  r.interimResults = true;
+  r.continuous = false; // the recognizer ends by itself when the speaker pauses
+  r.maxAlternatives = 1;
 
   let finalText = '';
   let interim = '';
-  rec.onresult = (e) => {
+  let fatal = false;
+  r.onresult = (e) => {
     interim = '';
     finalText = '';
     for (let i = 0; i < e.results.length; i++) {
@@ -267,7 +313,11 @@ function listen(who) {
     }
     showLive('🎤 ' + (finalText + interim));
   };
-  rec.onerror = (e) => {
+  r.onerror = (e) => {
+    if (e.error === 'aborted') return;
+    // Silence is normal while waiting for someone to talk in auto mode.
+    if (autoMode && e.error === 'no-speech') return;
+    fatal = ['not-allowed', 'service-not-allowed', 'audio-capture', 'network'].includes(e.error);
     const msg = {
       'not-allowed': '請允許使用麥克風（在瀏覽器網址列旁邊的設定打開）',
       'service-not-allowed': '請允許使用麥克風與語音辨識',
@@ -275,18 +325,54 @@ function listen(who) {
       'network': '語音辨識需要網路，請確認網路',
       'audio-capture': '找不到麥克風',
     }[e.error];
+    if (fatal && autoMode) setAuto(false);
     if (msg) toast(msg);
   };
-  rec.onend = () => {
-    const text = (finalText || interim).trim();
+  r.onend = async () => {
+    if (rec !== r) return;
+    const text = recAborted ? '' : (finalText || interim).trim();
+    rec = null;
+    showLive('');
+    if (!autoMode) {
+      setListening(null);
+      if (text) handleText(who, text);
+      return;
+    }
+    if (!text) { scheduleAutoListen(fatal ? 1500 : 250); return; }
+    autoBusy = true;
+    autoTurn = other(who);
+    setListening(null);
+    try { await handleText(who, text); } finally { autoBusy = false; }
+    scheduleAutoListen(300);
+  };
+  setListening(who);
+  showLive(turnPrompt(who));
+  try {
+    r.start();
+  } catch (e) {
     rec = null;
     setListening(null);
     showLive('');
-    if (text) handleText(recWho, text);
-  };
-  setListening(who);
-  showLive(who === 'me' ? '🎤 請說中文…' : '🎤 ' + LANGS[settings.lang].tap + '…');
-  try { rec.start(); } catch (e) { rec = null; setListening(null); showLive(''); toast('無法開始錄音，請再按一次'); }
+    if (autoMode) setAuto(false);
+    toast('無法開始錄音，請再按一次');
+  }
+}
+
+function setAuto(on) {
+  autoMode = on;
+  clearTimeout(autoRestartTimer);
+  const btn = $('autoBtn');
+  btn.classList.toggle('on', on);
+  btn.textContent = on ? '⏹️ 自動對話中（按這裡停止）' : '🔁 自動對話（不用一直按）';
+  if (on) {
+    unlockTts();
+    autoTurn = 'me';
+    if (rec) { recAborted = true; rec.abort(); } else if (!autoBusy) startRec('me');
+  } else {
+    if (rec) { recAborted = true; rec.abort(); }
+    setListening(null);
+    showLive('');
+  }
 }
 
 let toastTimer;
@@ -430,6 +516,9 @@ function init() {
 
   $('micMe').onclick = () => listen('me');
   $('micThem').onclick = () => listen('them');
+  $('autoBtn').onclick = () => { if (!SR) { listen('me'); return; } setAuto(!autoMode); };
+  // Never keep the microphone on in the background.
+  document.addEventListener('visibilitychange', () => { if (document.hidden && autoMode) setAuto(false); });
 
   $('typeBtn').onclick = () => { $('typeRow').hidden = !$('typeRow').hidden; if (!$('typeRow').hidden) $('typeInput').focus(); };
   const sendTyped = (who) => { unlockTts(); handleText(who, $('typeInput').value); $('typeInput').value = ''; };
@@ -451,6 +540,7 @@ function init() {
       $('talk').hidden = name !== 'talk';
       $('photo').hidden = name !== 'photo';
       $('talkBar').hidden = name !== 'talk';
+      if (name !== 'talk' && autoMode) setAuto(false);
       if (name === 'photo') loadTesseract().catch(() => {});
     };
   }

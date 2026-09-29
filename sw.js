@@ -1,5 +1,5 @@
 // Caches the app itself so it opens quickly; translation still needs the network.
-const CACHE = 'translator-v1';
+const CACHE = 'translator-v2';
 const FILES = ['./', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', (e) => {
