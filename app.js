@@ -132,6 +132,7 @@ function renderLangs() {
       save('settings', settings);
       renderLangs();
       if (autoMode && rec) { recAborted = true; rec.abort(); } // restarts in the new language
+      prewarmOcr();
     };
     grid.appendChild(b);
   }
@@ -409,18 +410,45 @@ function loadTesseract() {
   return tesseractLoading;
 }
 
-let ocrWorker = null;
-let ocrWorkerLangs = null;
+// "Fast" models are several times quicker than Tesseract.js's default "best" models
+// on phones, with only slightly lower accuracy.
+const OCR_FAST_MODELS = 'https://cdn.jsdelivr.net/gh/tesseract-ocr/tessdata_fast@4.1.0';
+
+let ocrLang = null;
+let ocrWorkerPromise = null;
 let ocrProgress = () => {};
-async function getWorker(langs) {
-  if (ocrWorker && ocrWorkerLangs === langs) return ocrWorker;
-  if (ocrWorker) { await ocrWorker.terminate(); ocrWorker = null; }
-  ocrWorker = await Tesseract.createWorker(langs, 1, { logger: (m) => ocrProgress(m) });
-  ocrWorkerLangs = langs;
-  return ocrWorker;
+let photoBusy = false;
+
+// One worker per language, created ahead of time and reused for every photo.
+function getWorker(lang) {
+  if (ocrWorkerPromise && ocrLang === lang) return ocrWorkerPromise;
+  const old = ocrWorkerPromise;
+  ocrLang = lang;
+  const p = (async () => {
+    if (old) old.then((w) => w.terminate()).catch(() => {});
+    await loadTesseract();
+    const code = LANGS[lang].ocr;
+    const logger = (m) => ocrProgress(m);
+    try {
+      return await Tesseract.createWorker(code, 1, { logger, langPath: OCR_FAST_MODELS, gzip: false, cachePath: 'fast' });
+    } catch (e) {
+      console.warn('fast OCR model unavailable, using default', e);
+      return await Tesseract.createWorker(code, 1, { logger });
+    }
+  })();
+  ocrWorkerPromise = p;
+  p.catch(() => { if (ocrWorkerPromise === p) { ocrWorkerPromise = null; ocrLang = null; } });
+  return p;
 }
 
-function downscale(file, max = 1800) {
+// Start downloading/loading while the user is still aiming the camera.
+function prewarmOcr() {
+  if (photoBusy || $('photo').hidden) return;
+  getWorker(settings.lang).catch(() => {});
+}
+
+// ~1400px keeps menu text readable for OCR while being much quicker than full-size photos.
+function downscale(file, max = 1400) {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
@@ -458,15 +486,15 @@ async function handlePhoto(file) {
   preview.hidden = false;
 
   const lang = settings.lang;
-  const langs = lang === 'en' ? 'eng' : LANGS[lang].ocr + '+eng';
+  const started = performance.now();
+  photoBusy = true;
   try {
-    photoStatus('準備中…（第一次使用要下載資料，請稍等）');
-    const [canvas] = await Promise.all([downscale(file), loadTesseract()]);
+    photoStatus('準備中…（第一次使用這個語言要下載資料，請稍等）');
     ocrProgress = (m) => {
       if (m.status === 'recognizing text') photoStatus('正在讀照片上的字… ' + Math.round(m.progress * 100) + '%');
-      else if (/load/.test(m.status)) photoStatus('下載' + LANGS[lang].name + '辨識資料中…');
+      else if (/load/.test(m.status)) photoStatus('下載' + LANGS[lang].name + '辨識資料中…（只有第一次）');
     };
-    const worker = await getWorker(langs);
+    const [canvas, worker] = await Promise.all([downscale(file), getWorker(lang)]);
     const { data } = await worker.recognize(canvas);
     const lines = cleanOcr(data.text);
     if (!lines.length) {
@@ -493,9 +521,16 @@ async function handlePhoto(file) {
       p.querySelector('.acts').append(play, playOrig);
       result.appendChild(p);
     }
+    const took = document.createElement('p');
+    took.className = 'hint';
+    took.textContent = '（用了 ' + ((performance.now() - started) / 1000).toFixed(1) + ' 秒）';
+    result.appendChild(took);
   } catch (e) {
     console.error(e);
     photoStatus('處理失敗，請確認有網路後再試一次');
+  } finally {
+    photoBusy = false;
+    ocrProgress = () => {};
   }
 }
 
@@ -541,7 +576,7 @@ function init() {
       $('photo').hidden = name !== 'photo';
       $('talkBar').hidden = name !== 'talk';
       if (name !== 'talk' && autoMode) setAuto(false);
-      if (name === 'photo') loadTesseract().catch(() => {});
+      if (name === 'photo') prewarmOcr();
     };
   }
 
