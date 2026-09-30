@@ -21,7 +21,7 @@ function save(key, value) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* ignore */ }
 }
 
-const settings = Object.assign({ lang: 'en', autoSpeak: true, slow: false, big: false }, load('settings', {}));
+const settings = Object.assign({ lang: 'en', autoSpeak: true, slow: false, big: false, accurate: false }, load('settings', {}));
 let history = load('history', []);
 
 // ---------- Translation (free services) ----------
@@ -421,14 +421,16 @@ let photoBusy = false;
 
 // One worker per language, created ahead of time and reused for every photo.
 function getWorker(lang) {
-  if (ocrWorkerPromise && ocrLang === lang) return ocrWorkerPromise;
+  const key = lang + (settings.accurate ? ':best' : ':fast');
+  if (ocrWorkerPromise && ocrLang === key) return ocrWorkerPromise;
   const old = ocrWorkerPromise;
-  ocrLang = lang;
+  ocrLang = key;
   const p = (async () => {
     if (old) old.then((w) => w.terminate()).catch(() => {});
     await loadTesseract();
     const code = LANGS[lang].ocr;
     const logger = (m) => ocrProgress(m);
+    if (settings.accurate) return Tesseract.createWorker(code, 1, { logger });
     try {
       return await Tesseract.createWorker(code, 1, { logger, langPath: OCR_FAST_MODELS, gzip: false, cachePath: 'fast' });
     } catch (e) {
@@ -465,11 +467,63 @@ function downscale(file, max = 1400) {
   });
 }
 
-function cleanOcr(text) {
+// Words Tesseract is unsure about are usually smudges or background, not text.
+const OCR_MIN_CONFIDENCE = 55;
+const NO_SPACE_LANGS = ['ja', 'th'];
+
+function cleanLine(text) {
   const cjk = /([぀-ヿ㐀-鿿])\s+(?=[぀-ヿ㐀-鿿])/g;
-  return text.split('\n')
-    .map((l) => l.replace(cjk, '$1').replace(/\s+/g, ' ').trim())
-    .filter((l) => l.length >= 2 && /[\p{L}]/u.test(l));
+  return text.replace(cjk, '$1').replace(/\s+/g, ' ').trim()
+    .replace(/^[^\p{L}\p{N}$€£¥(（「"']+/u, '')
+    .replace(/[^\p{L}\p{N}.!?。！？)）」"'%$€£¥]+$/u, '');
+}
+
+function keepLine(text) {
+  return (text.match(/\p{L}/gu) || []).length >= 2;
+}
+
+// Wrapped lines of the same sentence are joined back together so the sentence
+// is translated as a whole; short stand-alone lines (menu items, signs) stay separate.
+function joinLines(lines, lang) {
+  const noSpace = NO_SPACE_LANGS.includes(lang);
+  const units = [];
+  for (const line of lines) {
+    const prev = units[units.length - 1];
+    const continues = prev && !/[.!?。！？:：;；]$/.test(prev) && (
+      /[,，、\-]$/.test(prev)
+      || prev.length >= (noSpace ? 12 : 25)
+      || (!noSpace && /^\p{Ll}/u.test(line)));
+    if (!continues) units.push(line);
+    else if (/\p{L}-$/u.test(prev)) units[units.length - 1] = prev.slice(0, -1) + line;
+    else units[units.length - 1] = prev + (noSpace ? '' : ' ') + line;
+  }
+  return units;
+}
+
+// Returns paragraphs, each a list of sentence-sized pieces to translate.
+function ocrParagraphs(data, lang) {
+  const paragraphs = [];
+  let dropped = 0;
+  for (const block of data.blocks || []) {
+    for (const para of block.paragraphs || []) {
+      const lines = [];
+      for (const line of para.lines || []) {
+        const words = line.words || [];
+        const good = words.filter((w) => w.confidence >= OCR_MIN_CONFIDENCE);
+        const text = cleanLine(good.map((w) => w.text).join(' '));
+        if (good.length * 2 >= words.length && keepLine(text)) lines.push(text);
+        else if (words.length) dropped++;
+      }
+      const units = joinLines(lines, lang);
+      if (units.length) paragraphs.push(units);
+    }
+  }
+  if (!data.blocks) {
+    // Older result format: plain text only.
+    const lines = (data.text || '').split('\n').map(cleanLine).filter(keepLine);
+    if (lines.length) paragraphs.push(joinLines(lines, lang));
+  }
+  return { paragraphs, dropped };
 }
 
 function photoStatus(msg) {
@@ -495,21 +549,36 @@ async function handlePhoto(file) {
       else if (/load/.test(m.status)) photoStatus('下載' + LANGS[lang].name + '辨識資料中…（只有第一次）');
     };
     const [canvas, worker] = await Promise.all([downscale(file), getWorker(lang)]);
-    const { data } = await worker.recognize(canvas);
-    const lines = cleanOcr(data.text);
-    if (!lines.length) {
+    const { data } = await worker.recognize(canvas, {}, { text: true, blocks: true });
+    const { paragraphs, dropped } = ocrParagraphs(data, lang);
+    if (!paragraphs.length) {
       photoStatus('找不到文字。請靠近一點、光線亮一點、拿穩再拍一次，也請確認上面選的語言正確。');
       return;
     }
     photoStatus('翻譯中…');
-    const translated = (await translate(lines.join('\n'), lang, ZH)).split('\n');
+    const units = paragraphs.flat();
+    let translated = (await translate(units.join('\n'), lang, ZH)).split('\n');
+    if (translated.length !== units.length) {
+      // The service merged or split lines; translate each piece on its own instead.
+      translated = await Promise.all(units.map((u) => translate(u, lang, ZH)));
+    }
     photoStatus('');
-    const same = translated.length === lines.length;
-    const pairs = same ? lines.map((l, i) => [l, translated[i]]) : [[lines.join('\n'), translated.join('\n')]];
-    for (const [orig, trans] of pairs) {
+
+    const allZh = translated.join('\n');
+    const playAll = document.createElement('button');
+    playAll.className = 'small-btn';
+    playAll.textContent = '🔊 全部唸中文';
+    playAll.onclick = () => speak(allZh, ZH);
+    result.appendChild(playAll);
+
+    let i = 0;
+    for (const para of paragraphs) {
+      const orig = para.join('\n');
+      const trans = translated.slice(i, i + para.length).join('\n');
+      i += para.length;
       const p = document.createElement('div');
       p.className = 'pair';
-      p.innerHTML = '<div class="orig"></div><div class="trans"></div><div class="acts"></div>';
+      p.innerHTML = '<div class="trans"></div><div class="orig"></div><div class="acts"></div>';
       p.querySelector('.orig').textContent = orig;
       p.querySelector('.trans').textContent = trans;
       const play = document.createElement('button');
@@ -520,6 +589,12 @@ async function handlePhoto(file) {
       playOrig.onclick = () => speak(orig, LANGS[lang].speech);
       p.querySelector('.acts').append(play, playOrig);
       result.appendChild(p);
+    }
+    if (dropped) {
+      const note = document.createElement('p');
+      note.className = 'hint';
+      note.textContent = '有 ' + dropped + ' 行看不清楚，已略過。想看到更多字，可以靠近一點再拍，或在「設定」打開精準模式。';
+      result.appendChild(note);
     }
     const took = document.createElement('p');
     took.className = 'hint';
@@ -540,6 +615,7 @@ function applySettings() {
   $('optAutoSpeak').checked = settings.autoSpeak;
   $('optSlow').checked = settings.slow;
   $('optBig').checked = settings.big;
+  $('optAccurate').checked = settings.accurate;
 }
 
 function init() {
@@ -595,6 +671,7 @@ function init() {
   $('optAutoSpeak').onchange = (e) => { settings.autoSpeak = e.target.checked; save('settings', settings); };
   $('optSlow').onchange = (e) => { settings.slow = e.target.checked; save('settings', settings); };
   $('optBig').onchange = (e) => { settings.big = e.target.checked; save('settings', settings); applySettings(); };
+  $('optAccurate').onchange = (e) => { settings.accurate = e.target.checked; save('settings', settings); prewarmOcr(); };
 
   const net = () => { $('offline').hidden = navigator.onLine; };
   window.addEventListener('online', net);

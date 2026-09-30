@@ -119,6 +119,8 @@ main { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
 .photo-preview { display: block; max-width: 100%; max-height: 35vh; margin: 8px auto; border-radius: 12px; }
 .status { background: #fff7d6; border-radius: 14px; padding: 12px; text-align: center; font-weight: 700; margin: 8px 0; }
 .photo-result { display: flex; flex-direction: column; gap: 10px; }
+.pair .trans { white-space: pre-line; }
+.pair .orig { white-space: pre-line; margin-top: 6px; }
 .pair { background: var(--card); border: 2px solid var(--line); border-radius: 16px; padding: 10px 14px; }
 .pair .orig { font-size: .75em; color: var(--muted); }
 .pair .trans { font-size: 1.1em; font-weight: 700; margin-top: 2px; }
