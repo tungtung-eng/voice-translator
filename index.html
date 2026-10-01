@@ -11,6 +11,8 @@
   <link rel="apple-touch-icon" href="icon-192.png">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="隨身翻譯">
+  <link rel="preconnect" href="https://translate.googleapis.com">
+  <link rel="preconnect" href="https://api.mymemory.translated.net">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -93,6 +95,13 @@
     <label class="check"><input type="checkbox" id="optAutoSpeak"> 翻譯完自動唸出來</label>
     <label class="check"><input type="checkbox" id="optSlow"> 唸慢一點</label>
     <label class="check"><input type="checkbox" id="optBig"> 字再大一點</label>
+    <label class="select">說完停多久就翻譯：
+      <select id="optPause">
+        <option value="fast">快（停 0.7 秒）</option>
+        <option value="normal">標準（停 1 秒）</option>
+        <option value="slow">慢（讓手機自己判斷）</option>
+      </select>
+    </label>
     <label class="check"><input type="checkbox" id="optAccurate"> 拍照用精準模式（字認得較準，但比較慢）</label>
     <p class="about">免費使用：語音辨識與朗讀用手機內建功能，翻譯用免費的網路翻譯服務，拍照文字辨識在手機上完成。</p>
     <button id="settingsClose" class="small-btn">完成</button>

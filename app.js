@@ -21,7 +21,7 @@ function save(key, value) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* ignore */ }
 }
 
-const settings = Object.assign({ lang: 'en', autoSpeak: true, slow: false, big: false, accurate: false }, load('settings', {}));
+const settings = Object.assign({ lang: 'en', autoSpeak: true, slow: false, big: false, accurate: false, pause: 'normal' }, load('settings', {}));
 let history = load('history', []);
 
 // ---------- Translation (free services) ----------
@@ -37,10 +37,16 @@ function chunks(text, max) {
   return out;
 }
 
+async function fetchWithTimeout(url, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try { return await fetch(url, { signal: ctrl.signal }); } finally { clearTimeout(timer); }
+}
+
 async function googleTranslate(text, from, to) {
   const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&dt=t'
     + '&sl=' + encodeURIComponent(from) + '&tl=' + encodeURIComponent(to) + '&q=' + encodeURIComponent(text);
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, 2500);
   if (!res.ok) throw new Error('google ' + res.status);
   const data = await res.json();
   return data[0].map((seg) => seg[0]).join('');
@@ -50,25 +56,43 @@ async function myMemoryTranslate(text, from, to) {
   const src = from === 'auto' ? settings.lang : from;
   const url = 'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(text)
     + '&langpair=' + encodeURIComponent(src + '|' + to);
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, 8000);
   if (!res.ok) throw new Error('mymemory ' + res.status);
   const data = await res.json();
   if (data.responseStatus !== 200 && data.responseStatus !== '200') throw new Error(data.responseDetails || 'mymemory');
   return data.responseData.translatedText;
 }
 
-async function translate(text, from, to) {
+// After Google fails, go straight to the fallback for a while instead of waiting on Google each time.
+let googleDownUntil = 0;
+
+async function translateUncached(text, from, to) {
   const out = [];
   for (const part of chunks(text, 1500)) {
     try {
+      if (Date.now() < googleDownUntil) throw new Error('google skipped');
       out.push(await googleTranslate(part, from, to));
     } catch (e) {
+      if (e.message !== 'google skipped') googleDownUntil = Date.now() + 60 * 1000;
       const sub = [];
       for (const p of chunks(part, 450)) sub.push(await myMemoryTranslate(p, from, to));
       out.push(sub.join('\n'));
     }
   }
   return out.join('\n');
+}
+
+// Same text → same request, so a translation started early (while the speaker
+// is pausing) is reused instead of fetched again.
+const translateCache = new Map();
+function translate(text, from, to) {
+  const key = from + '|' + to + '|' + text;
+  if (translateCache.has(key)) return translateCache.get(key);
+  const p = translateUncached(text, from, to);
+  translateCache.set(key, p);
+  p.catch(() => translateCache.delete(key));
+  if (translateCache.size > 200) translateCache.delete(translateCache.keys().next().value);
+  return p;
 }
 
 // ---------- Text to speech ----------
@@ -99,11 +123,25 @@ function speak(text, lang) {
   u.lang = lang;
   const v = pickVoice(lang);
   if (v) u.voice = v;
-  u.rate = settings.slow ? 0.75 : 0.95;
+  u.rate = settings.slow ? 0.75 : 1;
   return new Promise((resolve) => {
-    // Some browsers never fire onend; don't wait forever.
-    const safety = setTimeout(resolve, 3000 + text.length * 250);
-    u.onend = u.onerror = () => { clearTimeout(safety); resolve(); };
+    let started = false;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(safety);
+      clearInterval(poll);
+      resolve();
+    };
+    // Some phones fire onend late or never, so also watch speechSynthesis.speaking.
+    const poll = setInterval(() => {
+      if (speechSynthesis.speaking) started = true;
+      else if (started && !speechSynthesis.pending) finish();
+    }, 150);
+    const safety = setTimeout(finish, 2000 + text.length * (settings.slow ? 300 : 200));
+    u.onstart = () => { started = true; };
+    u.onend = u.onerror = finish;
     speechSynthesis.speak(u);
   });
 }
@@ -165,6 +203,7 @@ function addBubble(item) {
   const who = item.who === 'me' ? '我（中文 → ' + l.name + '）' : '對方（' + l.name + ' → 中文）';
   el.innerHTML = '<div class="who"></div><div class="orig"></div><div class="trans"></div><div class="acts"></div>';
   el.querySelector('.who').textContent = who;
+  el._who = who;
   el.querySelector('.orig').textContent = item.text;
   chat.appendChild(el);
   updateBubble(el, item);
@@ -190,6 +229,7 @@ function updateBubble(el, item) {
   }
   if (item.translated == null) { t.textContent = '翻譯中…'; return; }
   t.textContent = item.translated;
+  if (item.ms != null) el.querySelector('.who').textContent = el._who + ' · ' + (item.ms / 1000).toFixed(1) + ' 秒';
 
   const play = document.createElement('button');
   play.textContent = '🔊 再唸一次';
@@ -208,7 +248,8 @@ async function doTranslate(el, item) {
     const from = item.who === 'me' ? ZH : item.lang;
     const to = item.who === 'me' ? item.lang : ZH;
     item.translated = await translate(item.text, from, to);
-    history.push(item);
+    if (item.spokenAt) item.ms = Math.round(performance.now() - item.spokenAt);
+    history.push({ who: item.who, lang: item.lang, text: item.text, translated: item.translated, time: item.time });
     history = history.slice(-60);
     save('history', history);
     updateBubble(el, item);
@@ -221,10 +262,10 @@ async function doTranslate(el, item) {
   }
 }
 
-function handleText(who, text) {
+function handleText(who, text, spokenAt) {
   text = text.trim();
   if (!text) return;
-  const item = { who, lang: settings.lang, text, translated: null, time: Date.now() };
+  const item = { who, lang: settings.lang, text, translated: null, time: Date.now(), spokenAt };
   const el = addBubble(item);
   return doTranslate(el, item);
 }
@@ -241,6 +282,9 @@ let autoTurn = 'me';
 let autoBusy = false; // translating / speaking, not listening
 let autoRestartTimer = null;
 const other = (who) => (who === 'me' ? 'them' : 'me');
+
+// How long a pause ends a sentence. 'slow' leaves it to the phone (usually 2–3 s).
+const PAUSE_MS = { fast: 700, normal: 1100, slow: 0 };
 
 function setListening(who) {
   for (const [id, w] of [['micMe', 'me'], ['micThem', 'them']]) {
@@ -284,7 +328,7 @@ function listen(who) {
     if (rec) { recAborted = true; rec.abort(); } else if (!autoBusy) startRec(who);
     return;
   }
-  if (rec) { rec.stop(); return; }
+  if (rec) { rec._stoppedAt = performance.now(); rec.stop(); return; }
   startRec(who);
 }
 
@@ -305,6 +349,12 @@ function startRec(who) {
   let finalText = '';
   let interim = '';
   let fatal = false;
+  let pauseTimer = null;
+  let prefetchTimer = null;
+  let stoppedAt = null;
+  const lang = settings.lang;
+  const from = who === 'me' ? ZH : lang;
+  const to = who === 'me' ? lang : ZH;
   r.onresult = (e) => {
     interim = '';
     finalText = '';
@@ -312,7 +362,15 @@ function startRec(who) {
       if (e.results[i].isFinal) finalText += e.results[i][0].transcript;
       else interim += e.results[i][0].transcript;
     }
-    showLive('🎤 ' + (finalText + interim));
+    const text = (finalText + interim).trim();
+    showLive('🎤 ' + text);
+    clearTimeout(pauseTimer);
+    clearTimeout(prefetchTimer);
+    if (!text) return;
+    // Start translating during the pause so the result is ready when the turn ends.
+    prefetchTimer = setTimeout(() => translate(text, from, to).catch(() => {}), 400);
+    const pause = PAUSE_MS[settings.pause] || 0;
+    if (pause) pauseTimer = setTimeout(() => { if (rec === r) { stoppedAt = performance.now(); r.stop(); } }, pause);
   };
   r.onerror = (e) => {
     if (e.error === 'aborted') return;
@@ -330,21 +388,25 @@ function startRec(who) {
     if (msg) toast(msg);
   };
   r.onend = async () => {
+    clearTimeout(pauseTimer);
+    clearTimeout(prefetchTimer);
     if (rec !== r) return;
-    const text = recAborted ? '' : (finalText || interim).trim();
+    // finalText + interim: stopping early can leave the last words as interim.
+    const text = recAborted ? '' : (finalText + interim).trim();
+    const spokenAt = stoppedAt || r._stoppedAt || performance.now();
     rec = null;
     showLive('');
     if (!autoMode) {
       setListening(null);
-      if (text) handleText(who, text);
+      if (text) handleText(who, text, spokenAt);
       return;
     }
-    if (!text) { scheduleAutoListen(fatal ? 1500 : 250); return; }
+    if (!text) { scheduleAutoListen(fatal ? 1500 : 150); return; }
     autoBusy = true;
     autoTurn = other(who);
     setListening(null);
-    try { await handleText(who, text); } finally { autoBusy = false; }
-    scheduleAutoListen(300);
+    try { await handleText(who, text, spokenAt); } finally { autoBusy = false; }
+    scheduleAutoListen(100);
   };
   setListening(who);
   showLive(turnPrompt(who));
@@ -616,6 +678,7 @@ function applySettings() {
   $('optSlow').checked = settings.slow;
   $('optBig').checked = settings.big;
   $('optAccurate').checked = settings.accurate;
+  $('optPause').value = settings.pause;
 }
 
 function init() {
@@ -671,6 +734,7 @@ function init() {
   $('optAutoSpeak').onchange = (e) => { settings.autoSpeak = e.target.checked; save('settings', settings); };
   $('optSlow').onchange = (e) => { settings.slow = e.target.checked; save('settings', settings); };
   $('optBig').onchange = (e) => { settings.big = e.target.checked; save('settings', settings); applySettings(); };
+  $('optPause').onchange = (e) => { settings.pause = e.target.value; save('settings', settings); };
   $('optAccurate').onchange = (e) => { settings.accurate = e.target.checked; save('settings', settings); prewarmOcr(); };
 
   const net = () => { $('offline').hidden = navigator.onLine; };
