@@ -10,6 +10,7 @@ const LANGS = {
   id: { name: '印尼文', native: 'Bahasa Indonesia', flag: '🇮🇩', speech: 'id-ID', ocr: 'ind', tap: 'Ketuk untuk bicara' },
 };
 const ZH = 'zh-TW';
+const APP_VERSION = '2026.10.07';
 
 const $ = (id) => document.getElementById(id);
 
@@ -472,10 +473,10 @@ function setAuto(on) {
 }
 
 let toastTimer;
-function toast(msg) {
+function toast(msg, icon = '⚠️') {
   const live = $('live');
   live.hidden = false;
-  live.textContent = '⚠️ ' + msg;
+  live.textContent = icon + ' ' + msg;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { if (!rec) live.hidden = true; }, 4000);
 }
@@ -752,8 +753,22 @@ function init() {
     showLive('');
     if (window.speechSynthesis) speechSynthesis.cancel();
   };
+  // iPhone (Safari and home-screen apps) often leaves the microphone deaf after the app
+  // has been in the background: speech recognition seems to run but hears nothing, and
+  // only reloading the page fixes it. History and settings are saved, so reload.
+  let micStale = false;
+  const reloadForMic = () => {
+    try { sessionStorage.setItem('micReloaded', '1'); } catch (e) { /* ignore */ }
+    location.reload();
+  };
   // Coming back: phones may have broken speech and the photo reader in the meantime.
   const onVisible = () => {
+    if (SR && hiddenAt && Date.now() - hiddenAt > 1000) {
+      // On the photo tab the camera itself sends the app to the background,
+      // so wait until the user goes back to the talk tab.
+      if (!$('talk').hidden) { reloadForMic(); return; }
+      micStale = true;
+    }
     ttsUnlocked = false; // iPhone needs a fresh tap before it will speak again
     if (window.speechSynthesis) { speechSynthesis.cancel(); refreshVoices(); }
     setListening(null);
@@ -781,6 +796,7 @@ function init() {
     tab.onclick = () => {
       for (const t of document.querySelectorAll('.tab')) t.classList.toggle('active', t === tab);
       const name = tab.dataset.tab;
+      if (name === 'talk' && micStale) { reloadForMic(); return; }
       $('talk').hidden = name !== 'talk';
       $('photo').hidden = name !== 'photo';
       $('talkBar').hidden = name !== 'talk';
@@ -806,6 +822,14 @@ function init() {
   $('optBig').onchange = (e) => { settings.big = e.target.checked; save('settings', settings); applySettings(); };
   $('optPause').onchange = (e) => { settings.pause = e.target.value; save('settings', settings); };
   $('optAccurate').onchange = (e) => { settings.accurate = e.target.checked; save('settings', settings); prewarmOcr(); };
+
+  $('version').textContent = '版本 ' + APP_VERSION;
+  try {
+    if (sessionStorage.getItem('micReloaded')) {
+      sessionStorage.removeItem('micReloaded');
+      toast('麥克風已重新準備好，可以按按鈕說話了', '✅');
+    }
+  } catch (e) { /* ignore */ }
 
   const net = () => { $('offline').hidden = navigator.onLine; };
   window.addEventListener('online', net);
