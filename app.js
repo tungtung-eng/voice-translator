@@ -169,7 +169,7 @@ function renderLangs() {
       settings.lang = code;
       save('settings', settings);
       renderLangs();
-      if (autoMode && rec) { recAborted = true; rec.abort(); } // restarts in the new language
+      if (autoMode && rec) { dropRec(); scheduleAutoListen(150); } // restart in the new language
       prewarmOcr();
     };
     grid.appendChild(b);
@@ -325,11 +325,29 @@ function listen(who) {
   if (autoMode) {
     // In auto mode the buttons just hand the turn to that side.
     autoTurn = who;
-    if (rec) { recAborted = true; rec.abort(); } else if (!autoBusy) startRec(who);
+    dropRec();
+    if (!autoBusy) scheduleAutoListen(150);
     return;
   }
-  if (rec) { rec._stoppedAt = performance.now(); rec.stop(); return; }
+  if (rec) { stopRec(rec); return; }
   startRec(who);
+}
+
+// Phones can kill the recognizer (e.g. when the app goes to the background) without
+// ever calling onend. Never let a dead recognizer block the buttons.
+function dropRec() {
+  const r = rec;
+  if (!r) return;
+  rec = null; // its onend, if it ever comes, is ignored
+  recAborted = true;
+  try { r.abort(); } catch (e) { /* already dead */ }
+}
+
+// Stop and use what was heard; if the phone never answers, finish anyway.
+function stopRec(r) {
+  r._stoppedAt = r._stoppedAt || performance.now();
+  try { r.stop(); } catch (e) { /* already dead */ }
+  setTimeout(() => { if (rec === r) r.onend(); }, 1500);
 }
 
 function scheduleAutoListen(delay) {
@@ -352,6 +370,18 @@ function startRec(who) {
   let pauseTimer = null;
   let prefetchTimer = null;
   let stoppedAt = null;
+  // If the recognizer goes silent (no words, no end) for a long time, assume it died.
+  let idleTimer = null;
+  const armIdle = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      if (rec !== r) return;
+      dropRec();
+      showLive('');
+      if (autoMode) scheduleAutoListen(150); else setListening(null);
+    }, 15000);
+  };
+  armIdle();
   const lang = settings.lang;
   const from = who === 'me' ? ZH : lang;
   const to = who === 'me' ? lang : ZH;
@@ -363,6 +393,7 @@ function startRec(who) {
       else interim += e.results[i][0].transcript;
     }
     const text = (finalText + interim).trim();
+    armIdle();
     showLive('🎤 ' + text);
     clearTimeout(pauseTimer);
     clearTimeout(prefetchTimer);
@@ -370,7 +401,7 @@ function startRec(who) {
     // Start translating during the pause so the result is ready when the turn ends.
     prefetchTimer = setTimeout(() => translate(text, from, to).catch(() => {}), 400);
     const pause = PAUSE_MS[settings.pause] || 0;
-    if (pause) pauseTimer = setTimeout(() => { if (rec === r) { stoppedAt = performance.now(); r.stop(); } }, pause);
+    if (pause) pauseTimer = setTimeout(() => { if (rec === r) { stoppedAt = performance.now(); stopRec(r); } }, pause);
   };
   r.onerror = (e) => {
     if (e.error === 'aborted') return;
@@ -390,6 +421,7 @@ function startRec(who) {
   r.onend = async () => {
     clearTimeout(pauseTimer);
     clearTimeout(prefetchTimer);
+    clearTimeout(idleTimer);
     if (rec !== r) return;
     // finalText + interim: stopping early can leave the last words as interim.
     const text = recAborted ? '' : (finalText + interim).trim();
@@ -413,6 +445,7 @@ function startRec(who) {
   try {
     r.start();
   } catch (e) {
+    clearTimeout(idleTimer);
     rec = null;
     setListening(null);
     showLive('');
@@ -430,9 +463,9 @@ function setAuto(on) {
   if (on) {
     unlockTts();
     autoTurn = 'me';
-    if (rec) { recAborted = true; rec.abort(); } else if (!autoBusy) startRec('me');
+    if (rec) { dropRec(); if (!autoBusy) scheduleAutoListen(150); } else if (!autoBusy) startRec('me');
   } else {
-    if (rec) { recAborted = true; rec.abort(); }
+    dropRec();
     setListening(null);
     showLive('');
   }
@@ -503,6 +536,19 @@ function getWorker(lang) {
   ocrWorkerPromise = p;
   p.catch(() => { if (ocrWorkerPromise === p) { ocrWorkerPromise = null; ocrLang = null; } });
   return p;
+}
+
+function resetOcrWorker() {
+  const old = ocrWorkerPromise;
+  ocrWorkerPromise = null;
+  ocrLang = null;
+  if (old) old.then((w) => w.terminate()).catch(() => {});
+}
+
+function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), ms); });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 // Start downloading/loading while the user is still aiming the camera.
@@ -610,8 +656,8 @@ async function handlePhoto(file) {
       if (m.status === 'recognizing text') photoStatus('正在讀照片上的字… ' + Math.round(m.progress * 100) + '%');
       else if (/load/.test(m.status)) photoStatus('下載' + LANGS[lang].name + '辨識資料中…（只有第一次）');
     };
-    const [canvas, worker] = await Promise.all([downscale(file), getWorker(lang)]);
-    const { data } = await worker.recognize(canvas, {}, { text: true, blocks: true });
+    const [canvas, worker] = await Promise.all([downscale(file), withTimeout(getWorker(lang), 90000)]);
+    const { data } = await withTimeout(worker.recognize(canvas, {}, { text: true, blocks: true }), 60000);
     const { paragraphs, dropped } = ocrParagraphs(data, lang);
     if (!paragraphs.length) {
       photoStatus('找不到文字。請靠近一點、光線亮一點、拿穩再拍一次，也請確認上面選的語言正確。');
@@ -664,7 +710,12 @@ async function handlePhoto(file) {
     result.appendChild(took);
   } catch (e) {
     console.error(e);
-    photoStatus('處理失敗，請確認有網路後再試一次');
+    if (e.message === 'timeout') {
+      resetOcrWorker();
+      photoStatus('等太久沒有反應，請再拍一次');
+    } else {
+      photoStatus('處理失敗，請確認有網路後再試一次');
+    }
   } finally {
     photoBusy = false;
     ocrProgress = () => {};
@@ -691,8 +742,27 @@ function init() {
   $('micMe').onclick = () => listen('me');
   $('micThem').onclick = () => listen('them');
   $('autoBtn').onclick = () => { if (!SR) { listen('me'); return; } setAuto(!autoMode); };
-  // Never keep the microphone on in the background.
-  document.addEventListener('visibilitychange', () => { if (document.hidden && autoMode) setAuto(false); });
+  // Leaving the app: turn the microphone off and clear anything in progress.
+  let hiddenAt = 0;
+  const onHidden = () => {
+    hiddenAt = Date.now();
+    if (autoMode) setAuto(false);
+    dropRec();
+    setListening(null);
+    showLive('');
+    if (window.speechSynthesis) speechSynthesis.cancel();
+  };
+  // Coming back: phones may have broken speech and the photo reader in the meantime.
+  const onVisible = () => {
+    ttsUnlocked = false; // iPhone needs a fresh tap before it will speak again
+    if (window.speechSynthesis) { speechSynthesis.cancel(); refreshVoices(); }
+    setListening(null);
+    if (hiddenAt && Date.now() - hiddenAt > 30000 && !photoBusy) resetOcrWorker();
+    prewarmOcr();
+  };
+  document.addEventListener('visibilitychange', () => (document.hidden ? onHidden() : onVisible()));
+  window.addEventListener('pagehide', onHidden);
+  window.addEventListener('pageshow', (e) => { if (e.persisted) onVisible(); });
 
   $('typeBtn').onclick = () => { $('typeRow').hidden = !$('typeRow').hidden; if (!$('typeRow').hidden) $('typeInput').focus(); };
   const sendTyped = (who) => { unlockTts(); handleText(who, $('typeInput').value); $('typeInput').value = ''; };
